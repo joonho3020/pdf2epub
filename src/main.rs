@@ -1,12 +1,29 @@
 use pdfium_render::prelude::*;
 use thiserror::Error;
-use image::{DynamicImage, RgbImage};
-use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
-use std::path::PathBuf;
-use rten::{Model, ModelLoadError};
+use image::{DynamicImage, RgbImage, ImageFormat};
 use indicatif;
-#[allow(unused)]
-use rten_tensor::prelude::*;
+use anyhow::{Context, Result};
+use leptess::LepTess;
+use std::io::Cursor;
+use clap::Parser;
+use epub_builder::{EpubBuilder, EpubContent, ZipLibrary, ReferenceType};
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Input file path
+// #[arg(short, long)]
+// input: PathBuf,
+
+// /// Output file path
+// #[arg(short, long)]
+// output: PathBuf,
+
+    /// If set to true, remove pagenum from the bottom of the page
+    #[arg(long)]
+    extract_pagenum: bool,
+}
 
 #[derive(Debug, Error)]
 pub enum Pdf2EPubErr {
@@ -16,14 +33,11 @@ pub enum Pdf2EPubErr {
     #[error("PdfiumError error: {0}")]
     PdfiumError(#[from] PdfiumError),
 
-    #[error("OCRSImageSourceError error: {0}")]
-    OCRSImageSourceError(#[from] ocrs::ImageSourceError),
-
-    #[error("ModelLoadError error: {0}")]
-    ModelLoadError(#[from] ModelLoadError),
-
     #[error("AnyHowError error: {0}")]
-    AnyHowError(#[from] anyhow::Error)
+    AnyHowError(#[from] anyhow::Error),
+
+    #[error("ZipLibrary error")]
+    ZipLibraryError(#[from] epub_builder::Error),
 }
 
 /// Convert a single `PdfPage` into the RGB byte buffer
@@ -43,61 +57,183 @@ pub fn img_source_from_page(
         .set_target_height(h_pixels)
         .use_grayscale_rendering(true);
 
-    // 1️⃣ Rasterise with Pdfium
     let bitmap = page.render_with_config(&render_config)?;
     let dyn_image: DynamicImage = bitmap.as_image();
     let rgb8: RgbImage = dyn_image.into_rgb8();
 
     Ok(rgb8)
-
 }
 
-/// Extract string out from the image by performing OCR
-pub fn perform_ocr(img: &RgbImage, engine: &OcrEngine) -> Result<String, Pdf2EPubErr> {
-    let img_source = ImageSource::from_bytes(img.as_raw(), img.dimensions())?;
-    let ocr_input = engine.prepare_input(img_source)?;
-    let text = engine.get_text(&ocr_input)?;
+pub fn ocr_rgb_png(img: &RgbImage) -> Result<String, Pdf2EPubErr> {
+    let mut png_bytes: Vec<u8> = Vec::new();
+    DynamicImage::ImageRgb8(img.clone())
+        .write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)
+        .context("failed to encode PNG")?;
+
+    let mut lt = LepTess::new(None, "eng")
+        .context("could not create Tesseract engine")?;
+
+    lt.set_image_from_mem(&png_bytes)
+        .context("Tesseract failed to load image from memory")?;
+
+    let text = lt.get_utf8_text()
+        .context("Tesseract failed to recognise text")?;
+
     Ok(text)
 }
 
-/// Given a file path relative to the crate root, return the absolute path.
-fn file_path(path: &str) -> PathBuf {
-    let mut abs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    abs_path.push(path);
-    abs_path
+/// Remove a trailing page number like "...some text\n\n11" and return it.
+/// On failure the original text is left intact and page_num is None.
+pub fn peel_trailing_page_num(s: &str) -> (&str, Option<u32>) {
+    let trimmed = s.trim_end();
+    match trimmed.rsplit_once(char::is_whitespace) {
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+            (head.trim_end(), Some(tail.parse::<u32>().expect("number")))
+        }
+        _ => (trimmed, None),
+    }
 }
 
-/// Create a new OCR engine
-pub fn try_new_ocr_engine() -> Result<OcrEngine, Pdf2EPubErr> {
-    let detection_model_path = file_path("models/text-detection.rten");
-    let rec_model_path = file_path("models/text-recognition.rten");
+/// Incrementally unwraps hard-wrapped lines *and* removes fake page-break
+/// blank lines.  Call `push_line()` for every raw line (in reading order),
+/// `page_break()` after finishing a page, and `finish()` at the very end.
+pub struct LineUnwrapper {
+    /// current paragraph being built
+    buf: String,
 
-    let detection_model = Model::load_file(detection_model_path)?;
-    let recognition_model = Model::load_file(rec_model_path)?;
+    // fully emitted text
+    out: String,
 
-    Ok(OcrEngine::new(OcrEngineParams {
-        detection_model: Some(detection_model),
-        recognition_model: Some(recognition_model),
-        ..Default::default()
-    })?)
+    pending_blank: bool,
+}
+
+impl LineUnwrapper {
+    pub fn new() -> Self {
+        Self { buf: String::new(), out: String::new(), pending_blank: false }
+    }
+
+    /// Push one **raw** line (possibly blank, with trailing `\n` removed).
+    pub fn push_line(&mut self, raw: &str) {
+        let line = raw.trim();
+
+        if line.is_empty() {
+            // postpone decision until we see the next non-blank line
+            self.pending_blank = true;
+            return;
+        }
+
+        // Decide what that previous blank really meant
+        if self.pending_blank {
+            self.pending_blank = false;
+
+            let prev_ended_sentence = self
+                .buf
+                .chars()
+                .rev()
+                .find(|c| !c.is_whitespace())
+                .map(|c| ".?!".contains(c))
+                .unwrap_or(false);
+
+            let this_starts_lower = line
+                .chars()
+                .next()
+                .map(|c| c.is_lowercase())
+                .unwrap_or(false);
+
+            if prev_ended_sentence || !this_starts_lower {
+                // Real paragraph break → flush current paragraph.
+                if !self.buf.is_empty() {
+                    self.out.push_str(self.buf.trim_end());
+                    self.out.push_str("\n\n");
+                    self.buf.clear();
+                }
+            }
+            // else: fake blank (from a page break); keep building same ¶
+        }
+
+        // Join the current line onto the paragraph buffer
+        if !self.buf.is_empty() {
+            if self.buf.ends_with('-') {
+                self.buf.pop();
+            } else {
+                self.buf.push(' ');
+            }
+        }
+        self.buf.push_str(line);
+    }
+
+    /// Consume the unwrapper and return the cleaned text
+    pub fn finish(mut self) -> String {
+        if !self.buf.is_empty() {
+            self.out.push_str(self.buf.trim_end());
+        }
+        self.out
+    }
+}
+
+fn text_to_xhtml(title: &str, body: &str) -> String {
+    use html_escape::encode_text;
+
+    let paras = body
+        .split("\n\n")                 // our “real” paragraph breaks
+        .map(|p| format!("<p>{}</p>", encode_text(p)))
+        .collect::<String>();
+
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+           <html xmlns="http://www.w3.org/1999/xhtml">
+             <head><title>{}</title></head>
+             <body>{}</body>
+           </html>"#,
+        encode_text(title),
+        paras
+    )
 }
 
 fn main() -> Result<(), Pdf2EPubErr> {
-    let ocr_engine = try_new_ocr_engine()?;
+    let args = Args::parse();
 
     let pdfium = Pdfium::new(Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./pdfium/lib")).unwrap());
     let pdf = pdfium.load_pdf_from_file("./examples/test-1.pdf", None)?;
     let progress_bar = indicatif::ProgressBar::new(pdf.pages().len() as u64);
+    let mut cleaner = LineUnwrapper::new();
 
-    for (index, page) in pdf.pages().iter().enumerate() {
+    for (_index, page) in pdf.pages().iter().enumerate() {
         progress_bar.inc(1);
-        let img = img_source_from_page(&page, 1000)?;
-        let text = perform_ocr(&img, &ocr_engine)?;
+        let img = img_source_from_page(&page, 300)?;
+        let raw_text = ocr_rgb_png(&img)?;
 
-        println!("==================== Page {} =====================", index);
-        println!("{}", text);
+        let (text, _pagenum_opt) = if args.extract_pagenum {
+            peel_trailing_page_num(&raw_text)
+        } else {
+            (raw_text.as_str(), None)
+        };
+
+        for line in text.lines() {
+            cleaner.push_line(line);
+        }
     }
-
     progress_bar.finish();
+
+    let final_text = cleaner.finish();
+    println!("{}", final_text);
+
+    let mut epub = EpubBuilder::new(ZipLibrary::new()?)?;
+    epub.metadata("title", "BOOK TITLE")?;
+    epub.metadata("author", "OCR Bot")?;
+    epub.set_lang("en");
+
+    let title = "TITLE".to_string();
+    let xhtml = text_to_xhtml(&title, &final_text);
+    epub.add_content(
+        EpubContent::new("FILENAME".to_string(), xhtml.as_bytes())
+        .title(&title)
+        .level(1)              // depth in the TOC
+        .reftype(ReferenceType::Text),
+    )?;
+
+    let mut out = std::fs::File::create("output.epub")?;
+    epub.generate(&mut out)?;
+
     Ok(())
 }
