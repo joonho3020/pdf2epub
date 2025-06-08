@@ -1,24 +1,28 @@
-use pdfium_render::prelude::*;
-use thiserror::Error;
-use image::{DynamicImage, RgbImage, ImageFormat};
-use indicatif;
-use anyhow::{Context, Result};
-use leptess::LepTess;
 use std::io::Cursor;
-use clap::Parser;
-use epub_builder::{EpubBuilder, EpubContent, ZipLibrary, ReferenceType};
 use std::path::PathBuf;
+use indicatif;
+use clap::Parser;
+use thiserror::Error;
+use pdfium_render::prelude::*;
+use leptess::LepTess;
+use image::{DynamicImage, RgbImage, ImageFormat};
+use anyhow::{Context, Result};
+use epub_builder::{EpubBuilder, EpubContent, ZipLibrary, ReferenceType};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Input file path
-// #[arg(short, long)]
-// input: PathBuf,
+    #[arg(short, long)]
+    input: PathBuf,
 
-// /// Output file path
-// #[arg(short, long)]
-// output: PathBuf,
+    /// Title of the book
+    #[arg(long)]
+    title: Option<String>,
+
+    /// Author of the book
+    #[arg(long)]
+    author: Option<String>,
 
     /// If set to true, remove pagenum from the bottom of the page
     #[arg(long)]
@@ -64,6 +68,7 @@ pub fn img_source_from_page(
     Ok(rgb8)
 }
 
+/// Perform ocr on `RbgImage` using Tesseract
 pub fn ocr_rgb_png(img: &RgbImage) -> Result<String, Pdf2EPubErr> {
     let mut png_bytes: Vec<u8> = Vec::new();
     DynamicImage::ImageRgb8(img.clone())
@@ -194,7 +199,7 @@ fn main() -> Result<(), Pdf2EPubErr> {
     let args = Args::parse();
 
     let pdfium = Pdfium::new(Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./pdfium/lib")).unwrap());
-    let pdf = pdfium.load_pdf_from_file("./examples/test-1.pdf", None)?;
+    let pdf = pdfium.load_pdf_from_file(args.input.to_str().expect("Invalid input path"), None)?;
     let progress_bar = indicatif::ProgressBar::new(pdf.pages().len() as u64);
     let mut cleaner = LineUnwrapper::new();
 
@@ -214,16 +219,16 @@ fn main() -> Result<(), Pdf2EPubErr> {
         }
     }
     progress_bar.finish();
-
     let final_text = cleaner.finish();
-    println!("{}", final_text);
+
+    let title = args.title.unwrap_or("ebook-output".to_string());
+    let author = args.author.unwrap_or("unknown author".to_string());
 
     let mut epub = EpubBuilder::new(ZipLibrary::new()?)?;
-    epub.metadata("title", "BOOK TITLE")?;
-    epub.metadata("author", "OCR Bot")?;
+    epub.metadata("title",  &title)?;
+    epub.metadata("author", &author)?;
     epub.set_lang("en");
 
-    let title = "TITLE".to_string();
     let xhtml = text_to_xhtml(&title, &final_text);
     epub.add_content(
         EpubContent::new("FILENAME".to_string(), xhtml.as_bytes())
@@ -232,7 +237,8 @@ fn main() -> Result<(), Pdf2EPubErr> {
         .reftype(ReferenceType::Text),
     )?;
 
-    let mut out = std::fs::File::create("output.epub")?;
+    let outfile = format!("{}-by-{}.epub", title, author);
+    let mut out = std::fs::File::create(outfile)?;
     epub.generate(&mut out)?;
 
     Ok(())
