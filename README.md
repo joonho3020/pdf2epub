@@ -20,3 +20,7 @@ cargo run --release -- --extract-pagenum
 
 - [ ] Make this multithreaded
 - [ ] Try using PDF structure if provided instead of raw OCR
+- [ ] Image extraction
+- [ ] Table extraction
+- [ ] Chapter by chapter
+- [ ] Better recognition of table of contents
