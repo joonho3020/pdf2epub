@@ -8,5 +8,5 @@ install_pdfium:
 
 
 download_ocr_models:
-  curl {{detection_model}}   -o text-detection.rten
-  curl {{recognition_model}} -o text-recognition.rten
+  curl {{detection_model}}   -o models/text-detection.rten
+  curl {{recognition_model}} -o models/text-recognition.rten

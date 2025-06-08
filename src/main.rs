@@ -4,6 +4,7 @@ use image::{DynamicImage, RgbImage};
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 use std::path::PathBuf;
 use rten::{Model, ModelLoadError};
+use indicatif;
 #[allow(unused)]
 use rten_tensor::prelude::*;
 
@@ -51,6 +52,7 @@ pub fn img_source_from_page(
 
 }
 
+/// Extract string out from the image by performing OCR
 pub fn perform_ocr(img: &RgbImage, engine: &OcrEngine) -> Result<String, Pdf2EPubErr> {
     let img_source = ImageSource::from_bytes(img.as_raw(), img.dimensions())?;
     let ocr_input = engine.prepare_input(img_source)?;
@@ -66,9 +68,9 @@ fn file_path(path: &str) -> PathBuf {
 }
 
 /// Create a new OCR engine
-pub fn ocr_engine() -> Result<OcrEngine, Pdf2EPubErr> {
-    let detection_model_path = file_path("examples/text-detection.rten");
-    let rec_model_path = file_path("examples/text-recognition.rten");
+pub fn try_new_ocr_engine() -> Result<OcrEngine, Pdf2EPubErr> {
+    let detection_model_path = file_path("models/text-detection.rten");
+    let rec_model_path = file_path("models/text-recognition.rten");
 
     let detection_model = Model::load_file(detection_model_path)?;
     let recognition_model = Model::load_file(rec_model_path)?;
@@ -81,10 +83,21 @@ pub fn ocr_engine() -> Result<OcrEngine, Pdf2EPubErr> {
 }
 
 fn main() -> Result<(), Pdf2EPubErr> {
-// let pdfium = Pdfium::new(Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./pdfium/lib")).unwrap());
-    for (index, page) in Pdfium::default().load_pdf_from_file("./examples/test-1.pdf", None)?.pages().iter().enumerate() {
-        page.objects();
+    let ocr_engine = try_new_ocr_engine()?;
+
+    let pdfium = Pdfium::new(Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./pdfium/lib")).unwrap());
+    let pdf = pdfium.load_pdf_from_file("./examples/test-1.pdf", None)?;
+    let progress_bar = indicatif::ProgressBar::new(pdf.pages().len() as u64);
+
+    for (index, page) in pdf.pages().iter().enumerate() {
+        progress_bar.inc(1);
+        let img = img_source_from_page(&page, 1000)?;
+        let text = perform_ocr(&img, &ocr_engine)?;
+
+        println!("==================== Page {} =====================", index);
+        println!("{}", text);
     }
 
+    progress_bar.finish();
     Ok(())
 }
