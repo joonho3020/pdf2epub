@@ -13,7 +13,7 @@ just install_pdfium
 ## QuickStart
 
 ```bash
-cargo run --release -- --extract-pagenum
+cargo run --release -- --extract-pagenum --input <path to input pdf file> --author <author name> --title <title name>
 ```
 
 ## TODO
